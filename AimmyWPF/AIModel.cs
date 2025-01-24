@@ -17,26 +17,25 @@ namespace AimmyAimbot
     public class AIModel : IDisposable
     {
         private const int IMAGE_SIZE = 640;
-        private const int NUM_DETECTIONS = 8400; // Standard for OnnxV8 model (Shape: 1x5x8400)
+        private const int NUM_DETECTIONS = 8400; // Standard for Yolov8 model (Shape: 1x5x8400)
 
-        private readonly RunOptions _modeloptions;
+        private readonly RunOptions _modelOptions;
         private InferenceSession _onnxModel;
 
-        public float ConfidenceThreshold = 0.6f;
-        public bool CollectData = false;
-        public int FovSize = 640;
+        public float ConfidenceThreshold = 0.6f; // Adjust confidence level
+        public bool CollectData = false; // Toggle data collection for debugging
+        public int FovSize = 640; // Field of view size in pixels
+        public float AimSmoothing = 0.1f; // Smoothness factor for human-like aim
 
-        private DateTime lastSavedTime = DateTime.MinValue;
+        private DateTime _lastSavedTime = DateTime.MinValue;
         private List<string> _outputNames;
-
         private Bitmap _screenCaptureBitmap = null;
-
-        // Image size will always be 640x640
-        private static byte[] _rgbValuesCache = new byte[640 * 640 * 3];
+        private static readonly byte[] _rgbValuesCache = new byte[640 * 640 * 3];
+        private readonly object _bitmapLock = new object();
 
         public AIModel(string modelPath)
         {
-            _modeloptions = new RunOptions();
+            _modelOptions = new RunOptions();
 
             var sessionOptions = new SessionOptions
             {
@@ -46,18 +45,16 @@ namespace AimmyAimbot
                 ExecutionMode = ExecutionMode.ORT_PARALLEL
             };
 
-            // Attempt to load via DirectML (else fallback to CPU)
             try
             {
                 LoadViaDirectML(sessionOptions, modelPath);
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"There was an error starting the OnnxModel via DirectML: {ex}\n\nProgram will attempt to use CPU only, performance may be poor.", "Model Error");
+                MessageBox.Show($"DirectML failed: {ex.Message}\nSwitching to CPU.", "Error");
                 LoadViaCPU(sessionOptions, modelPath);
             }
 
-            // Validate the onnx model output shape (ensure model is OnnxV8)
             ValidateOnnxShape();
         }
 
@@ -70,27 +67,19 @@ namespace AimmyAimbot
 
         private void LoadViaCPU(SessionOptions sessionOptions, string modelPath)
         {
-            try
-            {
-                sessionOptions.AppendExecutionProvider_CPU();
-                _onnxModel = new InferenceSession(modelPath, sessionOptions);
-                _outputNames = _onnxModel.OutputMetadata.Keys.ToList();
-            }
-            catch (Exception e)
-            {
-                MessageBox.Show($"Error starting the model via CPU: {e}");
-                System.Windows.Application.Current.Shutdown();
-            }
+            sessionOptions.AppendExecutionProvider_CPU();
+            _onnxModel = new InferenceSession(modelPath, sessionOptions);
+            _outputNames = _onnxModel.OutputMetadata.Keys.ToList();
         }
 
         private void ValidateOnnxShape()
         {
             foreach (var output in _onnxModel.OutputMetadata)
             {
-                var shape = _onnxModel.OutputMetadata[output.Key].Dimensions;
+                var shape = output.Value.Dimensions;
                 if (shape.Length != 3 || shape[0] != 1 || shape[1] != 5 || shape[2] != NUM_DETECTIONS)
                 {
-                    MessageBox.Show($"Output shape {string.Join("x", shape)} does not match the expected shape of 1x5x8400.\n\nThis model will not work with Aimmy, please use an ONNX V8 model.", "Model Error");
+                    throw new InvalidOperationException($"Invalid model shape: {string.Join("x", shape)}. Use a Yolov8 ONNX model.");
                 }
             }
         }
@@ -105,17 +94,21 @@ namespace AimmyAimbot
 
         public Bitmap ScreenGrab(Rectangle detectionBox)
         {
-            if (_screenCaptureBitmap == null || _screenCaptureBitmap.Width != detectionBox.Width || _screenCaptureBitmap.Height != detectionBox.Height)
+            lock (_bitmapLock)
             {
-                _screenCaptureBitmap?.Dispose();
-                _screenCaptureBitmap = new Bitmap(detectionBox.Width, detectionBox.Height);
-            }
+                if (_screenCaptureBitmap == null || _screenCaptureBitmap.Width != detectionBox.Width || _screenCaptureBitmap.Height != detectionBox.Height)
+                {
+                    _screenCaptureBitmap?.Dispose();
+                    _screenCaptureBitmap = new Bitmap(detectionBox.Width, detectionBox.Height);
+                }
 
-            using (var g = Graphics.FromImage(_screenCaptureBitmap))
-            {
-                g.CopyFromScreen(detectionBox.Left, detectionBox.Top, 0, 0, detectionBox.Size);
+                using (var g = Graphics.FromImage(_screenCaptureBitmap))
+                {
+                    g.CopyFromScreen(detectionBox.Left, detectionBox.Top, 0, 0, detectionBox.Size);
+                }
+
+                return (Bitmap)_screenCaptureBitmap.Clone();
             }
-            return _screenCaptureBitmap;
         }
 
         public static float[] BitmapToFloatArray(Bitmap image)
@@ -127,60 +120,55 @@ namespace AimmyAimbot
             BitmapData bmpData = image.LockBits(rect, ImageLockMode.ReadOnly, PixelFormat.Format24bppRgb);
 
             IntPtr ptr = bmpData.Scan0;
-            int bytes = Math.Abs(bmpData.Stride) * height;
-            byte[] rgbValues = new byte[bytes];
+            byte[] rgbValues = new byte[width * height * 3];
 
-            Marshal.Copy(ptr, rgbValues, 0, bytes);
-            for (int i = 0; i < rgbValues.Length / 3; i++)
+            Marshal.Copy(ptr, rgbValues, 0, rgbValues.Length);
+
+            Parallel.For(0, height, y =>
             {
-                int index = i * 3;
-                result[i] = rgbValues[index + 2] / 255.0f; // R
-                result[height * width + i] = rgbValues[index + 1] / 255.0f; // G
-                result[2 * height * width + i] = rgbValues[index] / 255.0f; // B
-            }
+                for (int x = 0; x < width; x++)
+                {
+                    int index = (y * width + x) * 3;
+                    int i = y * width + x;
+                    result[i] = rgbValues[index + 2] / 255.0f; // R
+                    result[height * width + i] = rgbValues[index + 1] / 255.0f; // G
+                    result[2 * height * width + i] = rgbValues[index] / 255.0f; // B
+                }
+            });
 
             image.UnlockBits(bmpData);
-
             return result;
         }
 
         public async Task<Prediction> GetClosestPredictionToCenterAsync()
         {
-            // Define the detection box
             int halfScreenWidth = Screen.PrimaryScreen.Bounds.Width / 2;
             int halfScreenHeight = Screen.PrimaryScreen.Bounds.Height / 2;
-            int detectionBoxSize = 640;
+            int detectionBoxSize = IMAGE_SIZE;
+
             Rectangle detectionBox = new Rectangle(halfScreenWidth - detectionBoxSize / 2,
                                                    halfScreenHeight - detectionBoxSize / 2,
                                                    detectionBoxSize,
                                                    detectionBoxSize);
 
-            // Capture a screenshot
             Bitmap frame = ScreenGrab(detectionBox);
 
-            // Save frame asynchronously if the option is turned on
-            if (CollectData && Bools.ConstantTracking == false)
+            if (CollectData && (DateTime.Now - _lastSavedTime).TotalSeconds >= 0.5)
             {
-                DateTime currentTime = DateTime.Now;
-                if ((currentTime - lastSavedTime).TotalSeconds >= 0.5)
-                {
-                    lastSavedTime = currentTime;
-                    string uuid = Guid.NewGuid().ToString();
-                    await Task.Run(() => frame.Save($"bin/images/{uuid}.jpg"));
-                }
+                _lastSavedTime = DateTime.Now;
+                string uuid = Guid.NewGuid().ToString();
+                await Task.Run(() => frame.Save($"bin/images/{uuid}.jpg"));
             }
 
-            // Convert the Bitmap to float array and normalize
             float[] inputArray = BitmapToFloatArray(frame);
-            if (inputArray == null) { return null; }
+            if (inputArray == null) return null;
 
             Tensor<float> inputTensor = new DenseTensor<float>(inputArray, new int[] { 1, 3, frame.Height, frame.Width });
             var inputs = new List<NamedOnnxValue> { NamedOnnxValue.CreateFromTensor("images", inputTensor) };
-            var results = _onnxModel.Run(inputs, _outputNames, _modeloptions);
 
+            using var results = _onnxModel.Run(inputs, _outputNames, _modelOptions);
             var outputTensor = results[0].AsTensor<float>();
 
-            // Calculate the FOV boundaries
             float fovMinX = (IMAGE_SIZE - FovSize) / 2.0f;
             float fovMaxX = (IMAGE_SIZE + FovSize) / 2.0f;
             float fovMinY = (IMAGE_SIZE - FovSize) / 2.0f;
@@ -189,11 +177,9 @@ namespace AimmyAimbot
             var tree = new KdTree<float, Prediction>(2, new FloatMath());
 
             var filteredIndices = Enumerable.Range(0, NUM_DETECTIONS)
-                                    .AsParallel()
-                                    .Where(i => outputTensor[0, 4, i] >= ConfidenceThreshold)
-                                    .ToList();
-
-            object treeLock = new object();
+                                            .AsParallel()
+                                            .Where(i => outputTensor[0, 4, i] >= ConfidenceThreshold)
+                                            .ToList();
 
             foreach (var i in filteredIndices)
             {
@@ -218,27 +204,45 @@ namespace AimmyAimbot
                         Confidence = objectness
                     };
 
-                    var centerX = (x_min + x_max) / 2.0f;
-                    var centerY = (y_min + y_max) / 2.0f;
-
-                    lock (treeLock)
-                    {
-                        tree.Add(new[] { centerX, centerY }, prediction);
-                    }
+                    tree.Add(new[] { x_center, y_center }, prediction);
                 }
             }
 
-            // Querying the KDTree for the closest prediction to the center.
             var nodes = tree.GetNearestNeighbours(new[] { IMAGE_SIZE / 2.0f, IMAGE_SIZE / 2.0f }, 1);
 
-            return nodes.Length > 0 ? nodes[0].Value : (Prediction?)null;
+            return nodes.Length > 0 ? SmoothPrediction(nodes[0].Value) : null;
+        }
+
+        private Prediction SmoothPrediction(Prediction target)
+        {
+            // Add smoothing for human-like movement
+            float centerX = target.Rectangle.X + target.Rectangle.Width / 2.0f;
+            float centerY = target.Rectangle.Y + target.Rectangle.Height / 2.0f;
+
+            centerX = Lerp(Screen.PrimaryScreen.Bounds.Width / 2, centerX, AimSmoothing);
+            centerY = Lerp(Screen.PrimaryScreen.Bounds.Height / 2, centerY, AimSmoothing);
+
+            target.Rectangle = new RectangleF(centerX - target.Rectangle.Width / 2,
+                                              centerY - target.Rectangle.Height / 2,
+                                              target.Rectangle.Width,
+                                              target.Rectangle.Height);
+
+            return target;
+        }
+
+        private float Lerp(float start, float end, float smoothing)
+        {
+            return start + (end - start) * smoothing;
         }
 
         public void Dispose()
         {
             _onnxModel?.Dispose();
-            _screenCaptureBitmap?.Dispose();
-            GC.SuppressFinalize(this); // called to prevent the finalizer from running if the object is already disposed of.
+            lock (_bitmapLock)
+            {
+                _screenCaptureBitmap?.Dispose();
+            }
+            GC.SuppressFinalize(this);
         }
     }
 }
